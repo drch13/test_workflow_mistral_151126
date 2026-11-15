@@ -11,10 +11,12 @@ Pipeline [Mistral Workflows](https://docs.mistral.ai/studio/workflows/overview) 
    - `ordonnance_medicaments` — prescription de médicaments
    - `ordonnance_imagerie` — prescription d'imagerie
    - `compte_rendu_imagerie` — compte-rendu d'imagerie
+   - `hors_categorie` — le document n'est pas un document médical des 4 catégories ci-dessus (poème, courrier personnel, document administratif, etc.)
    avec un `confidence` entre 0 et 1.
-4. **Validation humaine (human-in-the-loop)** : si `confidence < 0.7`, le pipeline se met en pause (`wait_for_input` avec une `ConfirmationInput` pré-remplie en description) et attend que l'utilisateur confirme ou corrige la catégorie avant de continuer.
-5. **Extraction** (`extract_document_fields`) : un appel à **Mistral Large 4** (`mistral-large-4`) en structured output extrait les informations du patient (nom, prénom, date de naissance, NIR, identifiant de dossier) et les champs spécifiques à la catégorie du document.
-6. Le workflow retourne un résumé Markdown (`ChatAssistantWorkflowOutput`).
+4. **Rejet automatique des documents hors catégories** : si le classificateur renvoie `hors_categorie` avec une confiance ≥ 0.7, le pipeline s'arrête immédiatement et retourne un résumé de rejet ; l'étape d'extraction n'est pas exécutée et aucune donnée patient n'est extraite.
+5. **Validation humaine (human-in-the-loop)** : si `confidence < 0.7`, le pipeline se met en pause (`wait_for_input` avec une `ConfirmationInput`) et attend que l'utilisateur confirme ou corrige la catégorie avant de continuer. L'option `hors_categorie` figure aussi parmi les choix : si l'utilisateur la sélectionne, le pipeline s'arrête avec un résumé de rejet, sans extraction.
+6. **Extraction** (`extract_document_fields`) : un appel à **Mistral Large 4** (`mistral-large-4`) en structured output extrait les informations du patient (nom, prénom, date de naissance, NIR, identifiant de dossier) et les champs spécifiques à la catégorie du document.
+7. Le workflow retourne un résumé Markdown (`ChatAssistantWorkflowOutput`).
 
 ## Développement local
 
@@ -50,7 +52,7 @@ client.workflows.executions.update_workflow_execution(
 )
 ```
 
-État d'avancement : query `get_pipeline_status` sur l'exécution.
+État d'avancement : query `get_pipeline_status` sur l'exécution. Le statut vaut `rejete` quand le document a été identifié hors catégories.
 
 ## Tests
 
@@ -58,4 +60,4 @@ client.workflows.executions.update_workflow_execution(
 uv run pytest
 ```
 
-Les tests utilisent `mistralai.workflows.testing.create_test_worker` avec un environnement Temporal en mémoire (`temporal_env_with_converter`) et un client Mistral mocké : scénarios confiance ≥ 0.7 (pas de pause), confiance < 0.7 (pause + catégorie confirmée/corrigée), et téléversement du PDF via formulaire.
+Les tests utilisent `mistralai.workflows.testing.create_test_worker` avec un environnement Temporal en mémoire (`temporal_env_with_converter`) et un client Mistral mocké : scénarios confiance ≥ 0.7 (pas de pause), confiance < 0.7 (pause + catégorie confirmée/corrigée), téléversement du PDF via formulaire, rejet automatique d'un document `hors_categorie` à confiance élevée (aucune extraction), et rejet après validation humaine de `hors_categorie` à confiance faible.
