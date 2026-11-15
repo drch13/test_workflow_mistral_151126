@@ -25,6 +25,7 @@ class DocumentCategory(str, Enum):
     MEDICATION_PRESCRIPTION = "ordonnance_medicaments"
     IMAGING_PRESCRIPTION = "ordonnance_imagerie"
     IMAGING_REPORT = "compte_rendu_imagerie"
+    OUT_OF_SCOPE = "hors_categorie"
 
     @property
     def label(self) -> str:
@@ -36,6 +37,7 @@ _CATEGORY_LABELS = {
     DocumentCategory.MEDICATION_PRESCRIPTION: "Prescription de médicaments",
     DocumentCategory.IMAGING_PRESCRIPTION: "Prescription d'imagerie",
     DocumentCategory.IMAGING_REPORT: "Compte-rendu d'imagerie",
+    DocumentCategory.OUT_OF_SCOPE: "Document hors catégories (non médical)",
 }
 
 CATEGORY_OPTIONS = [(category.value, category.label) for category in DocumentCategory]
@@ -120,14 +122,15 @@ class ExtractionResult(BaseModel):
 
 CLASSIFIER_SYSTEM_PROMPT = """Tu es un classificateur de documents médicaux (documents en français).
 
-Tu dois classer le document dans exactement UNE des 4 catégories suivantes :
+Tu dois classer le document dans exactement UNE des 5 catégories suivantes :
 - facture_hopital : facture d'hôpital, note d'honoraires, facture de clinique, feuille de soins à facturer
 - ordonnance_medicaments : prescription (ordonnance) de médicaments
 - ordonnance_imagerie : prescription (ordonnance) d'examen d'imagerie médicale (radio, scanner, IRM, échographie, mammographie, etc.)
 - compte_rendu_imagerie : compte-rendu d'examen d'imagerie médicale (résultat d'un examen déjà réalisé)
+- hors_categorie : le document n'est PAS un document médical des 4 catégories ci-dessus (par exemple un poème, un courrier personnel, un document administratif sans lien avec des soins). Utilise cette catégorie dès que le contenu ne correspond à aucune des 4 catégories médicales, même si le document évoque vaguement la santé.
 
 Réponds UNIQUEMENT avec un objet JSON conforme au schéma fourni :
-- category : la catégorie retenue (une des 4 valeurs ci-dessus)
+- category : la catégorie retenue (une des 5 valeurs ci-dessus)
 - confidence : ton score de confiance, un nombre entre 0.0 et 1.0
 - reasoning : une justification courte en français
 """
@@ -271,14 +274,41 @@ def _render_summary(
     )
 
 
+def _render_rejection(
+    document_name: str,
+    ocr: OcrResult,
+    classification: ClassificationResult,
+    reviewed: bool,
+) -> str:
+    if reviewed:
+        validation = (
+            f"Catégorie confirmée/corrigée manuellement (confiance initiale : {classification.confidence:.0%} < {CONFIDENCE_THRESHOLD:.0%})"
+        )
+    else:
+        validation = (
+            f"Rejet automatique (confiance : {classification.confidence:.0%} ≥ {CONFIDENCE_THRESHOLD:.0%})"
+        )
+    return (
+        f"# ⛔ Document rejeté : « {document_name} »\n\n"
+        f"- Modèle OCR : {ocr.model} ({ocr.page_count} page(s))\n"
+        f"- Catégorie : **{DocumentCategory.OUT_OF_SCOPE.label}** (`{DocumentCategory.OUT_OF_SCOPE.value}`)\n"
+        f"- Validation : {validation}\n"
+        f"- Justification du classificateur : {classification.reasoning or '—'}\n\n"
+        f"Ce document ne correspond à aucune des 4 catégories médicales prises en charge "
+        f"(facture d'hôpital, ordonnance de médicaments, ordonnance d'imagerie, compte-rendu d'imagerie). "
+        f"Le pipeline s'est arrêté avant l'étape d'extraction : aucune donnée patient n'a été extraite.\n"
+    )
+
+
 @workflows.workflow.define(
     name="medical-document-pipeline",
     workflow_display_name="Pipeline de documents médicaux",
     workflow_description=(
         "Traite un document médical PDF : extraction du texte par Mistral OCR 4.1, "
-        "classification du type de document par Mistral Small 4 (avec pause et validation "
-        "humaine si le score de confiance est < 0.7), puis extraction des informations "
-        "patient et des champs spécifiques par Mistral Large 4."
+        "classification du type de document par Mistral Small 4 parmi 4 catégories médicales "
+        "et une catégorie « hors_categorie » pour les documents non médicaux (rejet automatique "
+        "sans extraction), avec pause et validation humaine si le score de confiance est < 0.7, "
+        "puis extraction des informations patient et des champs spécifiques par Mistral Large 4."
     ),
     execution_timeout=timedelta(hours=24),
 )
@@ -326,13 +356,27 @@ class MedicalDocumentPipeline(workflows.InteractiveWorkflow):
 
         category = classification.category
         reviewed = False
+
+        # Rejet automatique : document hors catégories identifié avec confiance suffisante.
+        if (
+            category is DocumentCategory.OUT_OF_SCOPE
+            and classification.confidence >= CONFIDENCE_THRESHOLD
+        ):
+            self.category = category.value
+            self.status = "rejete"
+            summary = _render_rejection(self.document_name, ocr, classification, reviewed=False)
+            return mistralai_plugin.ChatAssistantWorkflowOutput(
+                content=[mistralai_plugin.TextOutput(text=summary)]
+            )
+
         if classification.confidence < CONFIDENCE_THRESHOLD:
             self.status = "validation_categorie"
             self.awaiting_review = True
             await mistralai_plugin.send_assistant_message(
                 f"Score de confiance insuffisant ({classification.confidence:.0%} < {CONFIDENCE_THRESHOLD:.0%}). "
                 f"Catégorie prédite : « {category.label} ». "
-                "Veuillez vérifier le document et confirmer ou corriger la catégorie pour continuer le pipeline."
+                "Veuillez vérifier le document et confirmer ou corriger la catégorie pour continuer le pipeline, "
+                "ou choisir « hors_categorie » pour rejeter un document non médical."
             )
             review = await self.wait_for_input(
                 ConfirmationInput(
@@ -340,7 +384,8 @@ class MedicalDocumentPipeline(workflows.InteractiveWorkflow):
                     description=(
                         f"Catégorie prédite par le classificateur : « {category.label} » "
                         f"(confiance : {classification.confidence:.0%}). "
-                        "Confirmez cette catégorie ou sélectionnez la bonne."
+                        "Confirmez cette catégorie, sélectionnez la bonne, ou choisissez "
+                        "« hors_categorie » si le document n'est pas un document médical."
                     ),
                 ),
                 label="Validation de la catégorie du document",
@@ -348,6 +393,15 @@ class MedicalDocumentPipeline(workflows.InteractiveWorkflow):
             category = DocumentCategory(review.choice)
             self.awaiting_review = False
             reviewed = True
+
+        # Rejet après validation humaine : l'utilisateur a confirmé que le document est hors catégories.
+        if category is DocumentCategory.OUT_OF_SCOPE:
+            self.category = category.value
+            self.status = "rejete"
+            summary = _render_rejection(self.document_name, ocr, classification, reviewed=reviewed)
+            return mistralai_plugin.ChatAssistantWorkflowOutput(
+                content=[mistralai_plugin.TextOutput(text=summary)]
+            )
 
         self.category = category.value
         self.status = "extraction"

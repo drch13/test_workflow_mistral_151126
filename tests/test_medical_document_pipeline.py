@@ -202,3 +202,60 @@ async def test_document_upload_form_when_no_url(temporal_env_with_converter, mon
     ocr_call = client.ocr.process_async.await_args_list[0]
     assert ocr_call.kwargs["document"]["document_url"] == "https://example.com/facture.pdf"
     assert ocr_call.kwargs["model"] == pipeline.OCR_MODEL
+
+
+async def test_out_of_scope_high_confidence_auto_rejects_without_extraction(temporal_env_with_converter, monkeypatch):
+    client = _make_client(monkeypatch, category="hors_categorie", confidence=0.92)
+    async with create_test_worker(
+        temporal_env_with_converter,
+        [MedicalDocumentPipeline],
+        activities=PIPELINE_ACTIVITIES,
+    ):
+        handle = await _start(
+            temporal_env_with_converter,
+            {"document_url": "https://example.com/poeme.png", "document_name": "poeme.png"},
+        )
+        result = await handle.result()
+
+    result_json = json.dumps(result, ensure_ascii=False)
+    assert "hors_categorie" in result_json
+    assert "rejeté" in result_json.lower() or "Document rejeté" in result_json
+    # Aucune extraction : un seul appel au modèle de chat (le classificateur).
+    assert client.chat.complete_async.await_count == 1
+    classifier_call = client.chat.complete_async.await_args_list[0]
+    assert classifier_call.kwargs["model"] == pipeline.CLASSIFIER_MODEL
+    final_status = await _query_status(handle)
+    if final_status is not None:
+        assert final_status["status"] == "rejete"
+        assert final_status["category"] == "hors_categorie"
+        assert final_status["awaiting_review"] is False
+
+
+async def test_low_confidence_review_confirms_out_of_scope_rejects(temporal_env_with_converter, monkeypatch):
+    client = _make_client(monkeypatch, category="facture_hopital", confidence=0.30)
+    async with create_test_worker(
+        temporal_env_with_converter,
+        [MedicalDocumentPipeline],
+        activities=PIPELINE_ACTIVITIES,
+    ):
+        handle = await _start(
+            temporal_env_with_converter,
+            {"document_url": "https://example.com/poeme.png", "document_name": "poeme.png"},
+        )
+        pending = await _wait_for_pending_input(handle, "Validation de la catégorie du document")
+
+        await handle.execute_update(
+            "__submit_input",
+            {"task_id": pending["task_id"], "input": {"choice": "hors_categorie"}},
+        )
+        result = await handle.result()
+
+    result_json = json.dumps(result, ensure_ascii=False)
+    assert "hors_categorie" in result_json
+    # Aucune extraction : seul le classificateur a été appelé.
+    assert client.chat.complete_async.await_count == 1
+    final_status = await _query_status(handle)
+    if final_status is not None:
+        assert final_status["status"] == "rejete"
+        assert final_status["category"] == "hors_categorie"
+        assert final_status["awaiting_review"] is False
