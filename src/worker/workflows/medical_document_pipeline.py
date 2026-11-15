@@ -210,6 +210,7 @@ async def classify_document(text: str) -> ClassificationResult:
         ],
         response_format=_json_schema("document_classification", ClassificationResult),
         temperature=0.0,
+        top_p=1.0,
     )
     return ClassificationResult.model_validate(json.loads(_completion_content(response)))
 
@@ -232,6 +233,7 @@ async def extract_document_fields(text: str, category: str) -> ExtractionResult:
         ],
         response_format=_json_schema("document_extraction", ExtractionResult),
         temperature=0.0,
+        top_p=1.0,
     )
     return ExtractionResult.model_validate(json.loads(_completion_content(response)))
 
