@@ -131,6 +131,9 @@ async def test_high_confidence_skips_human_review(temporal_env_with_converter, m
     classifier_call, extractor_call = client.chat.complete_async.await_args_list
     assert classifier_call.kwargs["model"] == pipeline.CLASSIFIER_MODEL
     assert extractor_call.kwargs["model"] == pipeline.EXTRACTOR_MODEL
+    for call in (classifier_call, extractor_call):
+        assert call.kwargs["temperature"] == 0.0
+        assert call.kwargs["top_p"] == 1.0
     assert "ordonnance_medicaments" in extractor_call.kwargs["messages"][1]["content"]
 
 
